@@ -1,13 +1,13 @@
 import logging
 import os
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Optional
+from typing import Literal, Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 
@@ -22,6 +22,10 @@ db = client[MONGO_DB]
 IST = timezone(timedelta(hours=5, minutes=30))
 
 logger = logging.getLogger("uvicorn.error")
+
+HHMM = r"^([01]\d|2[0-3]):[0-5]\d$"
+EPOCH_MIN = 100_000_000_000
+EPOCH_MAX = 4_102_444_800_000
 
 
 def _ensure_index(collection, keys, unique: bool = False) -> None:
@@ -89,19 +93,34 @@ def compute_overtime(
 # Models
 # --------------------------------------------------------------------------- #
 class EmployeeIn(BaseModel):
-    emp_code: str
-    name: str
-    email: str
-    department: str
-    shift_start: str = "09:30"
-    shift_end: str = "18:30"
-    joined_on: str
+    emp_code: str = Field(pattern=r"^EMP\d{4,6}$")
+    name: str = Field(min_length=1, max_length=100)
+    email: str = Field(max_length=120, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+    department: str = Field(min_length=1, max_length=50)
+    shift_start: str = Field(default="09:30", pattern=HHMM)
+    shift_end: str = Field(default="18:30", pattern=HHMM)
+    joined_on: str = Field(pattern=r"^\d{4}-\d{2}-\d{2}$")
+
+    @field_validator("joined_on")
+    @classmethod
+    def _check_joined_on(cls, v: str) -> str:
+        try:
+            date.fromisoformat(v)
+        except ValueError as exc:
+            raise ValueError("joined_on must be a valid YYYY-MM-DD date") from exc
+        return v
+
+    @model_validator(mode="after")
+    def _check_shift(self) -> "EmployeeIn":
+        if self.shift_start == self.shift_end:
+            raise ValueError("shift_start and shift_end must differ")
+        return self
 
 
 class PunchInIn(BaseModel):
     emp_code: str
-    punched_at: Optional[int] = None
-    status: str = "PRESENT"
+    punched_at: Optional[int] = Field(default=None, ge=EPOCH_MIN, le=EPOCH_MAX)
+    status: Literal["PRESENT", "WFH", "ON_DUTY"] = "PRESENT"
 
 
 # --------------------------------------------------------------------------- #
