@@ -2,6 +2,7 @@ import logging
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -58,20 +59,30 @@ app = FastAPI(
 # Helpers
 # --------------------------------------------------------------------------- #
 def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
+    pin = punch_in.astimezone(IST).replace(microsecond=0)
     h, m = map(int, shift_start.split(":"))
-    start = punch_in.replace(hour=h, minute=m, second=0, microsecond=0)
-    minutes = int((punch_in - start).total_seconds() / 60)
-    return minutes if minutes > 10 else 0
+    shift_start_dt = pin.replace(hour=h, minute=m, second=0)
+    elapsed = int((pin - shift_start_dt).total_seconds())
+    return 0 if elapsed <= 600 else elapsed // 60
 
 
 def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
-    return round((punch_out - punch_in).total_seconds() / 3600, 2)
+    seconds = int((punch_out - punch_in).total_seconds())
+    hours = Decimal(seconds) / Decimal(3600)
+    return float(hours.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
-def compute_overtime(punch_out: datetime, shift_end: str, date_str: str) -> int:
-    h, m = map(int, shift_end.split(":"))
-    end = datetime.fromisoformat(date_str).replace(hour=h, minute=m, tzinfo=IST)
-    return max(0, int((punch_out - end).total_seconds() / 60))
+def compute_overtime(
+    punch_out: datetime, shift_start: str, shift_end: str, date_str: str
+) -> int:
+    sh, sm = map(int, shift_start.split(":"))
+    eh, em = map(int, shift_end.split(":"))
+    end_date = datetime.fromisoformat(date_str)
+    if (eh, em) <= (sh, sm):
+        end_date += timedelta(days=1)
+    shift_end_dt = end_date.replace(hour=eh, minute=em, tzinfo=IST)
+    minutes = int((punch_out - shift_end_dt).total_seconds()) // 60
+    return minutes if minutes >= 30 else 0
 
 
 # --------------------------------------------------------------------------- #
