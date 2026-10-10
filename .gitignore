@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+.vscode/
+.pytest_cache/
+sample_data/
+sample_seed.py
