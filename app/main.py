@@ -1,7 +1,7 @@
 import logging
 import os
 from contextlib import asynccontextmanager
-from datetime import date, datetime, timedelta, timezone
+from datetime import date as date_cls, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Literal, Optional
 
@@ -142,7 +142,7 @@ class EmployeeIn(BaseModel):
     @classmethod
     def _check_joined_on(cls, v: str) -> str:
         try:
-            date.fromisoformat(v)
+            date_cls.fromisoformat(v)
         except ValueError as exc:
             raise ValueError("joined_on must be a valid YYYY-MM-DD date") from exc
         return v
@@ -163,6 +163,14 @@ class PunchInIn(BaseModel):
 class PunchOutIn(BaseModel):
     emp_code: str
     punched_at: Optional[int] = Field(default=None, ge=EPOCH_MIN, le=EPOCH_MAX)
+
+
+class RegularizeIn(BaseModel):
+    status: Optional[Literal["PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"]] = None
+    punch_in: Optional[int] = Field(default=None, ge=EPOCH_MIN, le=EPOCH_MAX)
+    punch_out: Optional[int] = Field(default=None, ge=EPOCH_MIN, le=EPOCH_MAX)
+    reason: str = Field(min_length=5, max_length=200)
+    regularized_by: str = Field(min_length=1, max_length=50)
 
 
 # --------------------------------------------------------------------------- #
@@ -288,6 +296,157 @@ def punch_out(body: PunchOutIn):
     )
     if result.modified_count == 0:
         raise HTTPException(status_code=409, detail="already punched out")
+
+    updated = db.attendance_logs.find_one({"_id": record["_id"]})
+    return _attendance_out(updated)
+
+
+@app.patch("/attendance/{emp_code}/{date}")
+def regularize_attendance(emp_code: str, date: date_cls, body: RegularizeIn):
+    emp = db.employees.find_one({"emp_code": emp_code})
+    if emp is None:
+        raise HTTPException(status_code=404, detail="employee not found")
+
+    date_str = date.isoformat()
+    record = db.attendance_logs.find_one({"emp_code": emp_code, "date": date_str})
+    if record is None:
+        raise HTTPException(status_code=404, detail="attendance record not found")
+
+    shift_start = emp["shift_start"]
+    shift_end = emp["shift_end"]
+    fields_set = body.model_fields_set
+
+    new_status = body.status if body.status is not None else record["status"]
+
+    if "punch_in" in fields_set:
+        new_punch_in = (
+            datetime.fromtimestamp(body.punch_in / 1000, tz=timezone.utc).replace(
+                microsecond=0
+            )
+            if body.punch_in is not None
+            else None
+        )
+    else:
+        new_punch_in = record.get("punch_in")
+
+    if "punch_out" in fields_set:
+        new_punch_out = (
+            datetime.fromtimestamp(body.punch_out / 1000, tz=timezone.utc).replace(
+                microsecond=0
+            )
+            if body.punch_out is not None
+            else None
+        )
+    else:
+        new_punch_out = record.get("punch_out")
+
+    if new_status in ("ABSENT", "LEAVE"):
+        if ("punch_in" in fields_set and body.punch_in is not None) or (
+            "punch_out" in fields_set and body.punch_out is not None
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="absent or leave status cannot have punch times",
+            )
+        new_punch_in = None
+        new_punch_out = None
+    else:
+        if new_punch_in is None:
+            raise HTTPException(
+                status_code=422, detail="presence status requires punch_in"
+            )
+        computed_date = attendance_date_for(new_punch_in, shift_start, shift_end)
+        if computed_date != record["date"]:
+            raise HTTPException(
+                status_code=422,
+                detail=f"punch_in does not fall on attendance date {record['date']}",
+            )
+        if new_punch_out is not None:
+            if new_punch_out <= new_punch_in:
+                raise HTTPException(
+                    status_code=422, detail="punch_out must be after punch_in"
+                )
+            if (new_punch_out - new_punch_in).total_seconds() > 24 * 3600:
+                raise HTTPException(
+                    status_code=422,
+                    detail="punch_out more than 24 hours after punch_in",
+                )
+
+    if new_punch_in is not None and new_status in ("PRESENT", "WFH", "ON_DUTY"):
+        new_late_minutes = compute_late_minutes(new_punch_in, shift_start)
+    else:
+        new_late_minutes = 0
+
+    if new_punch_in is not None and new_punch_out is not None:
+        new_work_hours = compute_work_hours(new_punch_in, new_punch_out)
+        new_overtime_minutes = compute_overtime(
+            new_punch_out, shift_start, shift_end, record["date"]
+        )
+        new_half_day = new_work_hours < 4.50
+    else:
+        new_work_hours = None
+        new_overtime_minutes = 0
+        new_half_day = False
+
+    old_status = record.get("status")
+    old_punch_in = record.get("punch_in")
+    old_punch_out = record.get("punch_out")
+    old_work_hours = record.get("work_hours")
+    old_late_minutes = record.get("late_minutes", 0)
+    old_overtime_minutes = record.get("overtime_minutes", 0)
+    old_half_day = record.get("half_day", False)
+
+    changes: dict = {}
+    if new_status != old_status:
+        changes["status"] = {"from": old_status, "to": new_status}
+    if new_punch_in != old_punch_in:
+        changes["punch_in"] = {"from": old_punch_in, "to": new_punch_in}
+    if new_punch_out != old_punch_out:
+        changes["punch_out"] = {"from": old_punch_out, "to": new_punch_out}
+    if new_work_hours != old_work_hours:
+        changes["work_hours"] = {"from": old_work_hours, "to": new_work_hours}
+    if new_late_minutes != old_late_minutes:
+        changes["late_minutes"] = {"from": old_late_minutes, "to": new_late_minutes}
+    if new_overtime_minutes != old_overtime_minutes:
+        changes["overtime_minutes"] = {
+            "from": old_overtime_minutes,
+            "to": new_overtime_minutes,
+        }
+    if new_half_day != old_half_day:
+        changes["half_day"] = {"from": old_half_day, "to": new_half_day}
+
+    if not changes:
+        raise HTTPException(status_code=422, detail="no changes")
+
+    history_entry = {
+        "at": datetime.now(timezone.utc).replace(microsecond=0),
+        "by": body.regularized_by,
+        "reason": body.reason,
+        "changes": changes,
+    }
+
+    result = db.attendance_logs.update_one(
+        {
+            "_id": record["_id"],
+            "status": old_status,
+            "punch_in": old_punch_in,
+            "punch_out": old_punch_out,
+        },
+        {
+            "$set": {
+                "status": new_status,
+                "punch_in": new_punch_in,
+                "punch_out": new_punch_out,
+                "work_hours": new_work_hours,
+                "late_minutes": new_late_minutes,
+                "overtime_minutes": new_overtime_minutes,
+                "half_day": new_half_day,
+            },
+            "$push": {"history": history_entry},
+        },
+    )
+    if result.modified_count == 0:
+        raise HTTPException(status_code=409, detail="record was modified concurrently")
 
     updated = db.attendance_logs.find_one({"_id": record["_id"]})
     return _attendance_out(updated)
