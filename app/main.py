@@ -6,10 +6,10 @@ from decimal import Decimal, ROUND_HALF_UP
 from typing import Literal, Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator, model_validator
 from pymongo import MongoClient
-from pymongo.errors import PyMongoError
+from pymongo.errors import DuplicateKeyError, PyMongoError
 
 load_dotenv()
 
@@ -62,6 +62,18 @@ app = FastAPI(
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
+def to_epoch_ms(dt: datetime) -> int:
+    return int(dt.timestamp() * 1000)
+
+
+def _employee_out(doc: dict) -> dict:
+    out = {k: v for k, v in doc.items() if k != "_id"}
+    created = out.get("created_at")
+    if isinstance(created, datetime):
+        out["created_at"] = to_epoch_ms(created)
+    return out
+
+
 def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
     pin = punch_in.astimezone(IST).replace(microsecond=0)
     h, m = map(int, shift_start.split(":"))
@@ -137,23 +149,33 @@ def health():
 
 @app.post("/employees", status_code=201)
 def create_employee(body: EmployeeIn):
-    if db.employees.find_one({"emp_code": body.emp_code}):
-        raise HTTPException(409, "emp_code already exists")
     doc = body.model_dump()
-    doc["created_at"] = datetime.now()
-    db.employees.insert_one(doc)
-    doc.pop("_id", None)
-    return doc
+    doc["created_at"] = datetime.now(timezone.utc).replace(microsecond=0)
+    try:
+        db.employees.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(status_code=409, detail="emp_code already exists")
+    return _employee_out(doc)
 
 
 @app.get("/employees")
-def list_employees(department: Optional[str] = None, page: int = 1, page_size: int = 20):
+def list_employees(
+    department: Optional[str] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
     q = {}
     if department:
         q["department"] = department
-    skip = page * page_size
-    total = db.employees.count_documents({})
-    items = list(db.employees.find(q, {"_id": 0}).skip(skip).limit(page_size))
+    skip = (page - 1) * page_size
+    total = db.employees.count_documents(q)
+    cursor = (
+        db.employees.find(q, {"_id": 0})
+        .sort("emp_code", 1)
+        .skip(skip)
+        .limit(page_size)
+    )
+    items = [_employee_out(d) for d in cursor]
     return {"items": items, "total": total, "page": page, "page_size": page_size}
 
 
