@@ -74,6 +74,31 @@ def _employee_out(doc: dict) -> dict:
     return out
 
 
+def _attendance_out(doc: dict) -> dict:
+    out = {k: v for k, v in doc.items() if k != "_id"}
+    for key in ("punch_in", "punch_out"):
+        if isinstance(out.get(key), datetime):
+            out[key] = to_epoch_ms(out[key])
+    for entry in out.get("history") or []:
+        if isinstance(entry.get("at"), datetime):
+            entry["at"] = to_epoch_ms(entry["at"])
+        for field, change in (entry.get("changes") or {}).items():
+            if field in ("punch_in", "punch_out"):
+                for edge in ("from", "to"):
+                    if isinstance(change.get(edge), datetime):
+                        change[edge] = to_epoch_ms(change[edge])
+    return out
+
+
+def attendance_date_for(punch_in: datetime, shift_start: str, shift_end: str) -> str:
+    pin = punch_in.astimezone(IST)
+    sh, sm = map(int, shift_start.split(":"))
+    eh, em = map(int, shift_end.split(":"))
+    if (eh, em) <= (sh, sm) and (pin.hour, pin.minute) < (eh, em):
+        pin = pin - timedelta(days=1)
+    return pin.date().isoformat()
+
+
 def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
     pin = punch_in.astimezone(IST).replace(microsecond=0)
     h, m = map(int, shift_start.split(":"))
@@ -182,13 +207,20 @@ def list_employees(
 @app.post("/attendance/punch-in", status_code=201)
 def punch_in(body: PunchInIn):
     emp = db.employees.find_one({"emp_code": body.emp_code})
-    ts = datetime.fromtimestamp(body.punched_at / 1000) if body.punched_at else datetime.now()
-    d = ts.date().isoformat()
-    if db.attendance_logs.find_one({"emp_code": body.emp_code, "date": d}):
-        raise HTTPException(409, "already punched in for this date")
+    if emp is None:
+        raise HTTPException(status_code=404, detail="employee not found")
+
+    if body.punched_at is None:
+        ts = datetime.now(timezone.utc)
+    else:
+        ts = datetime.fromtimestamp(body.punched_at / 1000, tz=timezone.utc)
+    ts = ts.replace(microsecond=0)
+
+    date_str = attendance_date_for(ts, emp["shift_start"], emp["shift_end"])
+
     doc = {
         "emp_code": body.emp_code,
-        "date": d,
+        "date": date_str,
         "status": body.status,
         "punch_in": ts,
         "punch_out": None,
@@ -198,10 +230,11 @@ def punch_in(body: PunchInIn):
         "half_day": False,
         "history": [],
     }
-    res = db.attendance_logs.insert_one(doc)
-    doc["id"] = str(res.inserted_id)
-    doc.pop("_id", None)
-    return doc
+    try:
+        db.attendance_logs.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(status_code=409, detail="already punched in for this date")
+    return _attendance_out(doc)
 
 
 @app.get("/attendance")
