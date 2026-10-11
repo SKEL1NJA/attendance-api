@@ -455,27 +455,34 @@ def regularize_attendance(emp_code: str, date: date_cls, body: RegularizeIn):
 @app.get("/attendance")
 def list_attendance(
     emp_code: Optional[str] = None,
-    date_from: Optional[str] = None,
-    date_to: Optional[str] = None,
-    status: Optional[str] = None,
-    page: int = 1,
-    page_size: int = 20,
+    date_from: Optional[date_cls] = None,
+    date_to: Optional[date_cls] = None,
+    status: Optional[Literal["PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"]] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
 ):
-    q = {}
+    if date_from and date_to and date_from > date_to:
+        raise HTTPException(status_code=422, detail="date_from must be <= date_to")
+
+    q: dict = {}
     if emp_code:
         q["emp_code"] = emp_code
     if date_from or date_to:
         q["date"] = {}
         if date_from:
-            q["date"]["$gte"] = date_from
+            q["date"]["$gte"] = date_from.isoformat()
         if date_to:
-            q["date"]["$lte"] = date_to
+            q["date"]["$lte"] = date_to.isoformat()
     if status:
         q["status"] = status
-    docs = list(db.attendance_logs.find(q))
-    docs.sort(key=lambda d: d["date"], reverse=True)
-    total = len(docs)
-    page_docs = docs[(page - 1) * page_size : page * page_size]
-    for d in page_docs:
-        d["id"] = str(d.pop("_id"))
-    return {"items": page_docs, "total": total, "page": page, "page_size": page_size}
+
+    skip = (page - 1) * page_size
+    total = db.attendance_logs.count_documents(q)
+    cursor = (
+        db.attendance_logs.find(q)
+        .sort([("date", -1), ("emp_code", 1)])
+        .skip(skip)
+        .limit(page_size)
+    )
+    items = [_attendance_out(d) for d in cursor]
+    return {"items": items, "total": total, "page": page, "page_size": page_size}
