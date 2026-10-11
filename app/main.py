@@ -160,6 +160,11 @@ class PunchInIn(BaseModel):
     status: Literal["PRESENT", "WFH", "ON_DUTY"] = "PRESENT"
 
 
+class PunchOutIn(BaseModel):
+    emp_code: str
+    punched_at: Optional[int] = Field(default=None, ge=EPOCH_MIN, le=EPOCH_MAX)
+
+
 # --------------------------------------------------------------------------- #
 # Endpoints
 # --------------------------------------------------------------------------- #
@@ -235,6 +240,57 @@ def punch_in(body: PunchInIn):
     except DuplicateKeyError:
         raise HTTPException(status_code=409, detail="already punched in for this date")
     return _attendance_out(doc)
+
+
+@app.post("/attendance/punch-out")
+def punch_out(body: PunchOutIn):
+    emp = db.employees.find_one({"emp_code": body.emp_code})
+    if emp is None:
+        raise HTTPException(status_code=404, detail="employee not found")
+
+    if body.punched_at is None:
+        ts = datetime.now(timezone.utc)
+    else:
+        ts = datetime.fromtimestamp(body.punched_at / 1000, tz=timezone.utc)
+    ts = ts.replace(microsecond=0)
+
+    record = db.attendance_logs.find_one(
+        {"emp_code": body.emp_code, "punch_in": {"$lte": ts}},
+        sort=[("punch_in", -1)],
+    )
+    if record is None:
+        raise HTTPException(status_code=404, detail="no punch-in found")
+    if record.get("punch_out") is not None:
+        raise HTTPException(status_code=409, detail="already punched out")
+
+    punch_in = record["punch_in"]
+    if ts <= punch_in:
+        raise HTTPException(status_code=422, detail="punched_at must be after punch_in")
+    if (ts - punch_in).total_seconds() > 24 * 3600:
+        raise HTTPException(
+            status_code=422, detail="punched_at more than 24 hours after punch_in"
+        )
+
+    work_hours = compute_work_hours(punch_in, ts)
+    overtime = compute_overtime(ts, emp["shift_start"], emp["shift_end"], record["date"])
+    half_day = work_hours < 4.50
+
+    result = db.attendance_logs.update_one(
+        {"_id": record["_id"], "punch_out": None},
+        {
+            "$set": {
+                "punch_out": ts,
+                "work_hours": work_hours,
+                "overtime_minutes": overtime,
+                "half_day": half_day,
+            }
+        },
+    )
+    if result.modified_count == 0:
+        raise HTTPException(status_code=409, detail="already punched out")
+
+    updated = db.attendance_logs.find_one({"_id": record["_id"]})
+    return _attendance_out(updated)
 
 
 @app.get("/attendance")
