@@ -823,3 +823,73 @@ def department_summary(
         )
 
     return {"month": month, "items": items}
+
+
+@app.get("/analytics/leaderboard/late")
+def late_leaderboard(
+    month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+    limit: int = Query(10, ge=1, le=50),
+    department: Optional[str] = None,
+):
+    year, mon = map(int, month.split("-"))
+    first_day = date_cls(year, mon, 1)
+    last_day = date_cls(year, mon, monthrange(year, mon)[1])
+
+    pipeline = [
+        {
+            "$match": {
+                "date": {
+                    "$gte": first_day.isoformat(),
+                    "$lte": last_day.isoformat(),
+                },
+                "late_minutes": {"$gt": 0},
+            }
+        },
+        {
+            "$group": {
+                "_id": "$emp_code",
+                "total_late_minutes": {"$sum": "$late_minutes"},
+                "late_count": {"$sum": 1},
+            }
+        },
+        {
+            "$lookup": {
+                "from": "employees",
+                "localField": "_id",
+                "foreignField": "emp_code",
+                "as": "emp",
+            }
+        },
+        {"$match": {"emp": {"$ne": []}}},
+        {"$unwind": "$emp"},
+    ]
+
+    if department:
+        pipeline.append({"$match": {"emp.department": department}})
+
+    pipeline.extend(
+        [
+            {
+                "$setWindowFields": {
+                    "sortBy": {"total_late_minutes": -1},
+                    "output": {"rank": {"$rank": {}}},
+                }
+            },
+            {"$match": {"rank": {"$lte": limit}}},
+            {"$sort": {"total_late_minutes": -1, "_id": 1}},
+            {
+                "$project": {
+                    "_id": 0,
+                    "rank": 1,
+                    "emp_code": "$_id",
+                    "name": "$emp.name",
+                    "department": "$emp.department",
+                    "total_late_minutes": 1,
+                    "late_count": 1,
+                }
+            },
+        ]
+    )
+
+    items = list(db.attendance_logs.aggregate(pipeline))
+    return {"month": month, "items": items}
