@@ -1,5 +1,6 @@
 import logging
 import os
+from calendar import monthrange
 from contextlib import asynccontextmanager
 from datetime import date as date_cls, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
@@ -97,6 +98,19 @@ def attendance_date_for(punch_in: datetime, shift_start: str, shift_end: str) ->
     if (eh, em) <= (sh, sm) and (pin.hour, pin.minute) < (eh, em):
         pin = pin - timedelta(days=1)
     return pin.date().isoformat()
+
+
+def count_working_days(start: date_cls, end: date_cls) -> int:
+    if start > end:
+        return 0
+    days = (end - start).days + 1
+    full_weeks, remainder = divmod(days, 7)
+    working = full_weeks * 5
+    weekday_of_start = start.weekday()
+    for i in range(remainder):
+        if (weekday_of_start + i) % 7 < 5:
+            working += 1
+    return working
 
 
 def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
@@ -486,3 +500,107 @@ def list_attendance(
     )
     items = [_attendance_out(d) for d in cursor]
     return {"items": items, "total": total, "page": page, "page_size": page_size}
+
+
+@app.get("/analytics/employees/{emp_code}/monthly")
+def employee_monthly(
+    emp_code: str,
+    month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+):
+    emp = db.employees.find_one({"emp_code": emp_code})
+    if emp is None:
+        raise HTTPException(status_code=404, detail="employee not found")
+
+    year, mon = map(int, month.split("-"))
+    first_day = date_cls(year, mon, 1)
+    last_day = date_cls(year, mon, monthrange(year, mon)[1])
+
+    joined = date_cls.fromisoformat(emp["joined_on"])
+    eligible_start = max(joined, first_day)
+    working_days = count_working_days(eligible_start, last_day)
+
+    pipeline = [
+        {
+            "$match": {
+                "emp_code": emp_code,
+                "date": {"$gte": first_day.isoformat(), "$lte": last_day.isoformat()},
+            }
+        },
+        {
+            "$facet": {
+                "presence": [
+                    {"$match": {"status": {"$in": ["PRESENT", "WFH", "ON_DUTY"]}}},
+                    {
+                        "$addFields": {
+                            "dow": {
+                                "$dayOfWeek": {
+                                    "$dateFromString": {"dateString": "$date"}
+                                }
+                            }
+                        }
+                    },
+                    {"$match": {"dow": {"$in": [2, 3, 4, 5, 6]}}},
+                    {
+                        "$group": {
+                            "_id": None,
+                            "present_days": {
+                                "$sum": {"$cond": ["$half_day", 0.5, 1]}
+                            },
+                        }
+                    },
+                ],
+                "leave": [
+                    {"$match": {"status": "LEAVE"}},
+                    {"$count": "leave_days"},
+                ],
+                "late": [
+                    {"$match": {"late_minutes": {"$gt": 0}}},
+                    {
+                        "$group": {
+                            "_id": None,
+                            "late_count": {"$sum": 1},
+                            "total_late_minutes": {"$sum": "$late_minutes"},
+                        }
+                    },
+                ],
+                "overtime": [
+                    {
+                        "$group": {
+                            "_id": None,
+                            "total_overtime_minutes": {"$sum": "$overtime_minutes"},
+                        }
+                    }
+                ],
+            }
+        },
+    ]
+
+    result = next(iter(db.attendance_logs.aggregate(pipeline)), {})
+    presence = result.get("presence") or [{}]
+    leave = result.get("leave") or [{}]
+    late = result.get("late") or [{}]
+    overtime = result.get("overtime") or [{}]
+
+    present_days = float(presence[0].get("present_days", 0.0))
+    leave_days = int(leave[0].get("leave_days", 0))
+    late_count = int(late[0].get("late_count", 0))
+    total_late_minutes = int(late[0].get("total_late_minutes", 0))
+    total_overtime_minutes = int(overtime[0].get("total_overtime_minutes", 0))
+
+    if working_days == 0:
+        attendance_pct = None
+    else:
+        pct = Decimal(present_days) / Decimal(working_days) * Decimal(100)
+        attendance_pct = float(pct.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP))
+
+    return {
+        "emp_code": emp_code,
+        "month": month,
+        "working_days": working_days,
+        "present_days": present_days,
+        "leave_days": leave_days,
+        "late_count": late_count,
+        "total_late_minutes": total_late_minutes,
+        "total_overtime_minutes": total_overtime_minutes,
+        "attendance_pct": attendance_pct,
+    }
