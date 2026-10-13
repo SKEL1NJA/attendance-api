@@ -67,6 +67,13 @@ def to_epoch_ms(dt: datetime) -> int:
     return int(dt.timestamp() * 1000)
 
 
+def round_half_up(value, places: int):
+    if value is None:
+        return None
+    quant = Decimal(1).scaleb(-places)
+    return float(Decimal(str(value)).quantize(quant, rounding=ROUND_HALF_UP))
+
+
 def _employee_out(doc: dict) -> dict:
     out = {k: v for k, v in doc.items() if k != "_id"}
     created = out.get("created_at")
@@ -893,3 +900,175 @@ def late_leaderboard(
 
     items = list(db.attendance_logs.aggregate(pipeline))
     return {"month": month, "items": items}
+
+
+@app.get("/analytics/departments/{department}/trend")
+def department_trend(
+    department: str,
+    from_: date_cls = Query(..., alias="from"),
+    to: date_cls = Query(...),
+):
+    if to < from_:
+        raise HTTPException(status_code=422, detail="to must be >= from")
+    if (to - from_).days + 1 > 92:
+        raise HTTPException(status_code=422, detail="range exceeds 92 days")
+
+    emp_docs = list(
+        db.employees.find(
+            {"department": department},
+            {"emp_code": 1, "joined_on": 1, "_id": 0},
+        )
+    )
+    if not emp_docs:
+        raise HTTPException(status_code=404, detail="department not found")
+
+    emp_codes = [e["emp_code"] for e in emp_docs]
+    joined_dates = [e["joined_on"] for e in emp_docs]
+
+    from_str = from_.isoformat()
+    to_str = to.isoformat()
+    from_dt = datetime(from_.year, from_.month, from_.day, tzinfo=timezone.utc)
+    to_dt = datetime(to.year, to.month, to.day, tzinfo=timezone.utc)
+
+    presence_statuses = ["PRESENT", "WFH", "ON_DUTY"]
+
+    pipeline = [
+        {
+            "$match": {
+                "emp_code": {"$in": emp_codes},
+                "date": {"$gte": from_str, "$lte": to_str},
+            }
+        },
+        {
+            "$group": {
+                "_id": "$date",
+                "present_count": {
+                    "$sum": {
+                        "$cond": [
+                            {"$in": ["$status", presence_statuses]},
+                            {
+                                "$cond": [
+                                    {"$ifNull": ["$half_day", False]},
+                                    0.5,
+                                    1,
+                                ]
+                            },
+                            0,
+                        ]
+                    }
+                },
+                "late_count": {
+                    "$sum": {
+                        "$cond": [
+                            {"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]},
+                            1,
+                            0,
+                        ]
+                    }
+                },
+            }
+        },
+        {
+            "$project": {
+                "_id": 0,
+                "date": "$_id",
+                "day": {"$dateFromString": {"dateString": "$_id"}},
+                "present_count": 1,
+                "late_count": 1,
+            }
+        },
+        {
+            "$densify": {
+                "field": "day",
+                "range": {
+                    "step": 1,
+                    "unit": "day",
+                    "bounds": [from_dt, to_dt],
+                },
+            }
+        },
+        {
+            "$addFields": {
+                "date": {
+                    "$ifNull": [
+                        "$date",
+                        {"$dateToString": {"format": "%Y-%m-%d", "date": "$day"}},
+                    ]
+                },
+                "present_count": {"$ifNull": ["$present_count", 0]},
+                "late_count": {"$ifNull": ["$late_count", 0]},
+            }
+        },
+        {
+            "$addFields": {
+                "is_working_day": {"$in": [{"$dayOfWeek": "$day"}, [2, 3, 4, 5, 6]]},
+                "headcount": {
+                    "$size": {
+                        "$filter": {
+                            "input": joined_dates,
+                            "as": "j",
+                            "cond": {"$lte": ["$$j", "$date"]},
+                        }
+                    }
+                },
+            }
+        },
+        {
+            "$addFields": {
+                "attendance_rate": {
+                    "$cond": [
+                        {
+                            "$and": [
+                                "$is_working_day",
+                                {"$gt": ["$headcount", 0]},
+                            ]
+                        },
+                        {"$divide": ["$present_count", "$headcount"]},
+                        None,
+                    ]
+                }
+            }
+        },
+        {
+            "$setWindowFields": {
+                "sortBy": {"day": 1},
+                "output": {
+                    "moving_avg_7d": {
+                        "$avg": "$attendance_rate",
+                        "window": {"documents": [-6, 0]},
+                    }
+                },
+            }
+        },
+        {"$sort": {"day": 1}},
+        {
+            "$project": {
+                "_id": 0,
+                "date": 1,
+                "is_working_day": 1,
+                "headcount": 1,
+                "present_count": 1,
+                "late_count": 1,
+                "attendance_rate": 1,
+                "moving_avg_7d": 1,
+            }
+        },
+    ]
+
+    rows = list(db.attendance_logs.aggregate(pipeline))
+
+    items = []
+    for r in rows:
+        items.append(
+            {
+                "date": r["date"],
+                "is_working_day": bool(r["is_working_day"]),
+                "headcount": int(r["headcount"]),
+                "present_count": float(r["present_count"]),
+                "late_count": int(r["late_count"]),
+                "attendance_rate": round_half_up(r.get("attendance_rate"), 4),
+                "moving_avg_7d": round_half_up(r.get("moving_avg_7d"), 4),
+            }
+        )
+
+    return {"department": department, "items": items}
